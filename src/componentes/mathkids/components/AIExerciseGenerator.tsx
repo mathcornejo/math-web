@@ -1,36 +1,12 @@
 import { useState } from "react";
-import { OLLAMA_MODEL } from "../config";
-import { getExerciseGeneratorPrompt } from "../prompts";
+import { getRewordPrompt } from "../prompts";
 import { extractJSON, ollamaGenerate } from "../services/ollama";
+import { generateExercises, type GenExercise } from "../services/exerciseEngine";
 import { ghostBtn, KEYFRAMES, primaryBtn } from "../styles";
 import { T } from "../theme";
-import type { Difficulty, Exercise, Level, Topic } from "../types";
+import type { Difficulty, Exercise, Level, LevelId, Topic } from "../types";
 
-/**
- * Normaliza un valor para comparación: quita espacios, $, marcas ✓, unidades
- * frecuentes y símbolos finales. "  $72 ✓ " → "72", "153.86 cm²" → "153.86".
- */
-function normalizeValue(s: string): string {
-  return s
-    .replace(/[✓✅]/g, "")
-    .replace(/\((?:opci|respuesta|correct)[^)]*\)/gi, "") // quita notas "(opción b)"
-    .trim()
-    .replace(/\s+/g, "")
-    .replace(/\$/g, "")
-    .replace(/[°%]/g, "")
-    .replace(/(cm³|cm²|m³|m²|cm|mm|km|kg|ml|min|m|g|l)$/i, "")
-    .replace(/^[a-z]=/i, "") // quita prefijo de variable "x=", "y=", "n="…
-    .toLowerCase();
-}
-
-/** Compara dos valores ya normalizados: numéricamente si ambos son números, si no por igualdad exacta. */
-function valuesMatch(a: string, b: string): boolean {
-  const isNum = (x: string) => /^-?\d*\.?\d+$/.test(x);
-  if (isNum(a) && isNum(b)) return Math.abs(parseFloat(a) - parseFloat(b)) < 0.001;
-  return a === b;
-}
-
-/** Limpia delimitadores LaTeX y signos de dólar que el modelo a veces inserta. */
+/** Limpia delimitadores LaTeX y signos de dólar que el modelo pueda insertar. */
 function cleanText(s: string): string {
   return String(s ?? "")
     .replace(/\\[()[\]]/g, "")  // \( \) \[ \]
@@ -39,113 +15,38 @@ function cleanText(s: string): string {
     .trim();
 }
 
-/** Normaliza un ejercicio recién parseado: limpia textos y quita prefijos "a. " de las opciones. */
-function sanitizeExercise(ex: Exercise): Exercise {
-  return {
-    ...ex,
-    q: cleanText(ex.q),
-    opts: (ex.opts ?? []).map(o => cleanText(o).replace(/^[a-dA-D][.)]\s*/, "")),
-    hint: cleanText(ex.hint),
-    explanation: ex.explanation
-      ? {
-          steps: (ex.explanation.steps ?? []).map(cleanText),
-          formula: ex.explanation.formula ? cleanText(ex.explanation.formula) : undefined,
-        }
-      : undefined,
-  };
-}
-
 /**
- * Extrae el valor de respuesta del último paso "real" de la explicación.
- * Ignora líneas de verificación/comprobación y toma el valor tras el último "=".
- * Devuelve null si no encuentra un resultado claro (el ejercicio se descartará).
+ * Reescritura OPCIONAL de enunciados con IA. Solo afecta al texto de la pregunta
+ * (`q`) de los ejercicios marcados como `rewordable`; nunca toca opciones,
+ * respuesta ni explicación (las calcula el motor determinista y son siempre
+ * correctas). Cada reescritura se acepta SOLO si conserva todos los números del
+ * enunciado original; si no, se conserva el texto determinista.
  */
-function extractAnswerFromExplanation(steps: string[]): string | null {
-  for (const raw of [...steps].reverse()) {
-    const step = raw.trim();
-    // Las líneas de verificación re-derivan el enunciado y darían un valor equivocado
-    if (/verif|comprob|comprueb/i.test(step)) continue;
+async function rewordWithAI(exs: GenExercise[], level: LevelId): Promise<GenExercise[]> {
+  const items = exs
+    .map((e, i) => ({ i, q: e.q, rewordable: e.rewordable }))
+    .filter(t => t.rewordable)
+    .map(t => ({ i: t.i, q: t.q }));
+  if (items.length === 0) return exs;
 
-    const eqMatches = [...step.matchAll(/=\s*([^=]+?)(?:[✓✅]|$)/g)];
-    if (eqMatches.length > 0) {
-      const candidate = eqMatches[eqMatches.length - 1][1]
-        .replace(/[✓✅]/g, "")
-        .replace(/\((?:opci|respuesta|correct)[^)]*\)/gi, "") // nota "(opción b)"
-        .trim();
-      if (candidate.length > 0 && candidate.length < 30) return candidate;
-    }
-    const res = step.match(/resultado[:\s]+([^\n]+)/i);
-    if (res) {
-      const candidate = res[1].replace(/[✓✅]/g, "").trim();
-      if (candidate.length > 0 && candidate.length < 30) return candidate;
-    }
-  }
-  return null;
-}
-
-/**
- * Verifica de forma INDEPENDIENTE que toda operación aritmética escrita en los
- * pasos sea correcta (ej: detecta "5 + 3 = 7" como falso). Si la explicación
- * contiene aritmética errónea, el ejercicio no es confiable.
- */
-function explanationArithmeticIsValid(steps: string[]): boolean {
-  const re = /(\d+(?:\.\d+)?)\s*([+\-−×x*/÷·])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?)/gi;
-  for (const step of steps) {
-    // Saltar pasos algebraicos (con variables): "5x-10+3=18" no es una afirmación
-    // aritmética sobre números, y validarla daría un falso negativo.
-    if (/\d[a-zA-Z]|[a-zA-Z]\s*[=(]|[a-zA-Z]\d/.test(step)) continue;
-    for (const m of step.matchAll(re)) {
-      const a = parseFloat(m[1]);
-      const b = parseFloat(m[3]);
-      const stated = parseFloat(m[4]);
-      let result: number | null = null;
-      switch (m[2]) {
-        case "+": result = a + b; break;
-        case "-": case "−": result = a - b; break;
-        case "×": case "x": case "*": case "·": result = a * b; break;
-        case "/": case "÷": result = b !== 0 ? a / b : null; break;
-      }
-      if (result === null) continue;
-      if (Math.abs(result - stated) > 0.05) return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Verificación CONSERVADORA para una plataforma de cero tolerancia a errores.
- * Un ejercicio sólo se acepta si:
- *  1. La aritmética de su explicación es correcta.
- *  2. Se puede extraer el resultado final de la explicación.
- *  3. Ese resultado coincide EXACTAMENTE con una (y sólo una) de las opciones.
- * En cualquier otro caso se DESCARTA (nunca se muestra sin verificar).
- * `ans` se reescribe siempre al índice verificado, ignorando el del modelo.
- */
-function verifyAndFixAns(exercises: Exercise[]): { fixed: Exercise[]; discarded: number } {
-  const fixed: Exercise[] = [];
-  let discarded = 0;
-
-  for (const ex of exercises) {
-    const steps = ex.explanation?.steps ?? [];
-
-    if (!explanationArithmeticIsValid(steps)) { discarded++; continue; }
-
-    const expected = extractAnswerFromExplanation(steps);
-    if (!expected) { discarded++; continue; }
-
-    const normExpected = normalizeValue(expected);
-    const matchingIdx = ex.opts
-      .map((opt, i) => ({ i, match: valuesMatch(normalizeValue(opt), normExpected) }))
-      .filter(x => x.match)
-      .map(x => x.i);
-
-    // Debe coincidir con exactamente una opción: ni cero (no está) ni varias (ambiguo)
-    if (matchingIdx.length !== 1) { discarded++; continue; }
-
-    fixed.push({ ...ex, ans: matchingIdx[0] });
+  const prompt = getRewordPrompt(level, items);
+  const resp = await ollamaGenerate(prompt, undefined, { think: false, temperature: 0.5, num_predict: 1200 });
+  const parsed = extractJSON<{ items?: { i: number; q: string }[] }>(resp);
+  const map = new Map<number, string>();
+  for (const it of parsed?.items ?? []) {
+    if (typeof it.i === "number" && typeof it.q === "string") map.set(it.i, it.q);
   }
 
-  return { fixed, discarded };
+  return exs.map((e, idx) => {
+    if (!e.rewordable) return e;
+    const reworded = map.get(idx);
+    if (!reworded) return e;
+    const cleaned = cleanText(reworded);
+    // VERIFICACIÓN: todos los números deben seguir presentes y longitud razonable.
+    const numbersOk = e.mustContain.every(tok => cleaned.includes(tok));
+    if (numbersOk && cleaned.length >= 10 && cleaned.length <= 200) return { ...e, q: cleaned };
+    return e; // reescritura no fiable → conservar enunciado determinista
+  });
 }
 
 interface AIExerciseGeneratorProps {
@@ -174,58 +75,38 @@ export function AIExerciseGenerator({ level, topic, color, onStartQuiz, onBack }
 
   async function generate() {
     setGenerating(true);
-    setGenPhase("thinking");
+    setGenPhase("building");
     setDetectedCount(0);
     setExercises(null);
     setError(null);
     try {
-      const prompt = getExerciseGeneratorPrompt(level.id, topic.title, difficulty, count);
-      const responseText = await ollamaGenerate(
-        prompt,
-        (chunk) => {
-          if (chunk.startsWith("🤔")) {
-            setGenPhase("thinking");
-          } else {
-            setGenPhase("building");
-            setDetectedCount((chunk.match(/"q"\s*:/g) ?? []).length);
-          }
-        },
-        {
-          think: false,       // Desactiva el razonamiento interno — no necesario para generar JSON
-          temperature: 0.4,   // Baja temperatura = JSON más consistente y predecible
-          num_predict: 2048,  // 5 ejercicios en JSON ≈ 800-1200 tokens; 2048 es suficiente
-        },
-      );
-      const parsed = extractJSON<{ exercises?: Exercise[] }>(responseText);
-      const raw = (parsed?.exercises ?? []).map(sanitizeExercise);
+      // 1) Generación DETERMINISTA: el motor calcula respuesta, opciones y
+      //    explicación. La matemática es siempre correcta y siempre hay set completo.
+      let gen = generateExercises(topic.id, difficulty, count);
+      setDetectedCount(gen.length);
 
-      // 1. Validación estructural
-      const structural = raw.filter(ex =>
-        typeof ex.q === "string" && ex.q.trim().length > 0 &&
-        Array.isArray(ex.opts) && ex.opts.length === 4 &&
-        Number.isInteger(ex.ans) && ex.ans >= 0 && ex.ans <= 3 &&
-        new Set(ex.opts).size === 4,
-      );
-
-      // 2. Verificar que opts[ans] coincide con la explicación — corregir si es posible
-      const { fixed, discarded } = verifyAndFixAns(structural);
-
-      if (fixed.length > 0) {
-        setExercises(fixed);
-        if (discarded > 0) {
-          // Informar al profesor/desarrollador sin bloquear al estudiante
-          console.warn(`[AI] ${discarded} ejercicio(s) descartados por inconsistencia entre ans y explicación.`);
+      // 2) Reescritura OPCIONAL con IA (solo enunciados tipo problema), verificada.
+      //    Si Ollama no está disponible o la reescritura altera los números, se
+      //    conserva el enunciado determinista. La matemática NUNCA cambia.
+      if (gen.some(g => g.rewordable)) {
+        setGenPhase("thinking");
+        try {
+          gen = await rewordWithAI(gen, level.id);
+        } catch {
+          /* sin conexión o error → se conservan los enunciados deterministas */
         }
-      } else if (structural.length > 0) {
-        setError(`El modelo generó ${raw.length} ejercicio(s) pero las respuestas no coincidían con las explicaciones. Intenta de nuevo.`);
-      } else if (raw.length > 0) {
-        setError(`El modelo generó ${raw.length} ejercicio(s) pero ninguno pasó la validación de estructura. Intenta de nuevo.`);
+      }
+
+      // 3) Quitar campos internos antes de entregar al quiz
+      const clean: Exercise[] = gen.map(({ mustContain: _m, rewordable: _r, ...e }) => e);
+      if (clean.length === 0) {
+        setError("No se pudieron preparar ejercicios para este tema. Intenta de nuevo.");
       } else {
-        setError("No se pudo parsear el JSON. Intenta de nuevo.");
+        setExercises(clean);
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      setError(`Error conectando con Ollama: ${message}`);
+      setError(`No se pudieron generar los ejercicios: ${message}`);
     } finally {
       setGenerating(false);
     }
@@ -310,9 +191,9 @@ export function AIExerciseGenerator({ level, topic, color, onStartQuiz, onBack }
 
           {genPhase === "thinking" ? (
             <>
-              <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:800, color:T.navy }}>Analizando el tema...</h3>
+              <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:800, color:T.navy }}>Dándole un toque con IA ✨</h3>
               <p style={{ margin:"0 0 24px", color:T.gray500, fontSize:14 }}>
-                El modelo está preparando ejercicios de <strong>{topic.title}</strong>
+                Redactando los enunciados de <strong>{topic.title}</strong> · la matemática ya está lista y verificada
               </p>
               {/* Puntos animados */}
               <div style={{ display:"flex", justifyContent:"center", gap:8 }}>
@@ -324,11 +205,11 @@ export function AIExerciseGenerator({ level, topic, color, onStartQuiz, onBack }
             </>
           ) : (
             <>
-              <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:800, color:T.navy }}>Creando ejercicios...</h3>
+              <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:800, color:T.navy }}>Preparando ejercicios...</h3>
               <p style={{ margin:"0 0 20px", color:T.gray500, fontSize:14 }}>
                 {detectedCount > 0
                   ? `${detectedCount} de ${count} ejercicios listos`
-                  : "Escribiendo preguntas y opciones..."}
+                  : "Calculando preguntas y opciones..."}
               </p>
               {/* Barra de progreso */}
               <div style={{ background:T.gray100, borderRadius:8, height:8, maxWidth:280, margin:"0 auto" }}>
@@ -345,10 +226,6 @@ export function AIExerciseGenerator({ level, topic, color, onStartQuiz, onBack }
         <div style={{ background:"#FEF2F2", border:`2px solid ${T.coral}`, borderRadius:16, padding:"20px 22px", marginBottom:20 }}>
           <p style={{ margin:"0 0 8px", fontWeight:700, color:T.coralDark }}>❌ Error</p>
           <p style={{ margin:"0 0 16px", color:T.gray800, fontSize:14 }}>{error}</p>
-          <p style={{ margin:"0 0 12px", color:T.gray500, fontSize:13 }}>
-            Asegúrate de que Ollama está corriendo: <code style={{ background:"#FEE2E2", padding:"2px 6px", borderRadius:4 }}>ollama serve</code><br/>
-            Y que el modelo está instalado: <code style={{ background:"#FEE2E2", padding:"2px 6px", borderRadius:4 }}>ollama pull {OLLAMA_MODEL}</code>
-          </p>
           <button onClick={generate} style={primaryBtn(T.coral)}>Reintentar</button>
         </div>
       )}

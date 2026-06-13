@@ -25,6 +25,36 @@ REGLAS DE COMPORTAMIENTO:
 NUNCA digas que eres una IA o menciones tu modelo. Eres MathBot.`;
 }
 
+/**
+ * Prompt para que la IA SOLO reescriba (haga más amenos) enunciados ya generados
+ * por el motor determinista. No debe cambiar números, operación ni resultado.
+ */
+export function getRewordPrompt(level: LevelId, items: { i: number; q: string }[]): string {
+  const levelName: Record<LevelId, string> = {
+    primaria: "primaria (6-12 años)",
+    secundaria: "secundaria (12-15 años)",
+    highschool: "high school (15-18 años)",
+  };
+  const list = items.map(it => `${it.i}: ${it.q}`).join("\n");
+  return `Eres un redactor de ejercicios de matemáticas para estudiantes de ${levelName[level]}.
+Te doy una lista de enunciados (cada uno con su índice). Reescribe SOLO la redacción
+para hacerla más amena y cercana, SIN cambiar la matemática.
+
+REGLAS ESTRICTAS:
+- Conserva EXACTAMENTE los mismos números y la misma operación. No cambies ninguna cifra.
+- No alteres el resultado ni añadas o quites datos. Mismo problema, otras palabras.
+- Texto plano en español, UNA sola oración breve (máximo 20 palabras). Sin LaTeX ni signos de dólar para fórmulas.
+- Mantén los mismos índices que recibiste.
+
+Responde ÚNICAMENTE con este JSON:
+\`\`\`json
+{"items":[{"i":0,"q":"enunciado reescrito"}]}
+\`\`\`
+
+Enunciados:
+${list}`;
+}
+
 export function getExerciseGeneratorPrompt(level: LevelId, topic: string, difficulty: Difficulty, count = 3): string {
   const levelDesc: Record<LevelId, string> = {
     primaria: "estudiantes de primaria (6-12 años), operaciones básicas, problemas simples con objetos cotidianos",
