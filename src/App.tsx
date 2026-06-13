@@ -1,5 +1,5 @@
 
-import MathKidsApp from './componentes/mathkids_platform'
+import MathKidsApp from './componentes/mathkids'
 
 function App() {
   return (
